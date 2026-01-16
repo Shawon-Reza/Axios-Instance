@@ -2,41 +2,114 @@
 
 ```jsx
 import axios from "axios";
+import { base_URL } from "../config/Config";
 
-// Create an instance of axios
+// Main API instance
 const axiosApi = axios.create({
-    baseURL: "http://10.10.13.59:8005",
-    headers: {
-        "Content-Type": "application/json",
-    },
+  baseURL: base_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
 });
 
-// Add request interceptor to include Bearer token automatically
+// Refresh-only instance (no interceptors)
+const refreshAxios = axios.create({
+  baseURL: base_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+/* ================= REQUEST ================= */
 axiosApi.interceptors.request.use(
-    (config) => {
-        let token = null;  // Declare token variable here
+  (config) => {
+    const auth = JSON.parse(localStorage.getItem("auth"));
 
-        try {
-            // Get access token from localStorage
-            token = JSON.parse(localStorage.getItem('token')) 
-                || JSON.parse(localStorage.getItem('adtoken')) 
-                || JSON.parse(localStorage.getItem('mtrtoken'));
-
-            console.log('Using token:', token); // Debug log to check which token is being used
-
-        } catch (error) {
-            console.error("Error parsing token from localStorage", error);
-        }
-
-        if (token) {
-            config.headers.Authorization = `Bearer ${token}`;
-        }
-
-        return config;
-    },
-    (error) => {
-        return Promise.reject(error);
+    if (auth?.access) {
+      config.headers.Authorization = `Bearer ${auth.access}`;
     }
+
+    if (config.data instanceof FormData) {
+      delete config.headers["Content-Type"];
+    }
+
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+/* ================= RESPONSE ================= */
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    error ? prom.reject(error) : prom.resolve(token);
+  });
+  failedQueue = [];
+};
+
+axiosApi.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      const auth = JSON.parse(localStorage.getItem("auth"));
+
+      if (!auth?.refresh) {
+        localStorage.removeItem("auth");
+        window.location.href = "/login";
+        return Promise.reject(error);
+      }
+
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({
+            resolve: (token) => {
+              originalRequest.headers.Authorization = `Bearer ${token}`;
+              resolve(axiosApi(originalRequest));
+            },
+            reject,
+          });
+        });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const res = await refreshAxios.post("api/token/refresh/", {
+          refresh: auth.refresh,
+        });
+
+        const newAccess = res.data.access;
+
+        localStorage.setItem(
+          "auth",
+          JSON.stringify({
+            access: newAccess,
+            refresh: auth.refresh,
+          })
+        );
+
+        processQueue(null, newAccess);
+
+        originalRequest.headers.Authorization = `Bearer ${newAccess}`;
+        return axiosApi(originalRequest);
+      } catch (err) {
+        processQueue(err, null);
+        localStorage.removeItem("auth");
+        window.location.href = "/login";
+        return Promise.reject(err);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
 );
 
 export default axiosApi;
+
